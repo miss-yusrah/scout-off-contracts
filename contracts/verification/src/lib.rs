@@ -135,6 +135,19 @@ const MAX_VOTING_WINDOW_SECS: u64 = 7_776_000;
 /// unbounded scan over every claim that has ever existed.
 const MAX_PENDING_VOTES_PER_VALIDATOR: u32 = 25;
 
+/// Seconds that must elapse after a dispute is resolved before the same
+/// milestone may be disputed again (issue #1396).
+const DISPUTE_REOPEN_COOLDOWN_SECS: u64 = 604_800; // 7 days
+/// Maximum dispute rounds per `(player_id, milestone_index)` inclusive of
+/// the initial filing (rounds `0 .. MAX_DISPUTE_ROUNDS-1`).
+const MAX_DISPUTE_ROUNDS: u32 = 3;
+/// Cap on concurrently open (unresolved) disputes a single player may hold.
+/// Protects `OpenDisputeIndex` from unbounded growth under spam filings.
+const MAX_OPEN_DISPUTES_PER_PLAYER: u32 = 5;
+/// Extra ledgers beyond the attestation voting window kept on vote keys
+/// (~1 day at 5s/ledger) so a just-expired claim remains readable for prune.
+const ATTESTATION_VOTE_TTL_MARGIN_LEDGERS: u32 = 17_280;
+
 // Generated client for the progress contract — used for cross-contract calls.
 // The progress contract must be deployed and its address registered via
 // `set_progress_contract` before `approve_milestone` can advance levels.
@@ -164,6 +177,13 @@ pub struct RegPlayerProfile {
     pub level: ProgressLevel,
     pub registered_at: u64,
     pub updated_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum RegPlayerStatus {
+    Active,
+    Deactivated,
 }
 
 #[contract]
@@ -1579,44 +1599,26 @@ impl VerificationContract {
         )
     }
 
+
     /// Cast one independent, asynchronous vote toward a k-of-n threshold
     /// milestone claim.
     ///
-    /// Canonical claim identity is `(player_id, evidence_hash)` — NOT
-    /// `description`. Two validators submitting independently-worded
-    /// descriptions for the same evidence still corroborate the same claim.
-    /// Requiring an exact description match instead would let wording
-    /// variance alone fracture legitimate consensus (a validator who
-    /// paraphrases "hat-trick in cup final" as "3 goals, regional final"
-    /// would silently open a second, disjoint claim rather than
-    /// corroborating the first) — a subtler and easier-to-trigger griefing
-    /// vector than trusting the immutable evidence artifact, which is what
-    /// `evidence_hash` already is. The description recorded on the
-    /// committed `Milestone` is therefore locked in by the first vote in
-    /// each round and is not overwritten by later voters, so the
-    /// threshold-reaching validator cannot rewrite the claim's narrative at
-    /// the last moment either.
+    /// Canonical claim *identity* is `(player_id, evidence_hash)` — description
+    /// text is intentionally excluded from the storage key. Within a voting
+    /// round, however, every vote must commit to the same description content:
+    /// the first voter of the round locks `description` + `description_hash =
+    /// sha256(description)`, and later voters whose description hashes differ
+    /// are rejected with `DescriptionMismatch` (issue #1397). On round expiry
+    /// the description resets — the first voter of the new round sets it again.
     ///
-    /// Storage is bounded and O(1) per vote regardless of how many distinct
-    /// validators eventually attest: each vote touches exactly one
-    /// fixed-size `PendingMilestoneClaim` record (a counter, not a growing
-    /// list of voters) plus one fixed-size per-(claim, validator) existence
-    /// marker used for duplicate-vote rejection. See `cost_budget.rs` /
-    /// `docs/CONTRACT_REFERENCE.md` for the measured CPU-instruction
-    /// evidence that cost does not grow with vote count.
+    /// Storage is bounded and O(threshold) per vote: each vote touches one
+    /// `PendingMilestoneClaim` (including a bounded `voters` list), one
+    /// per-(claim, validator) vote marker, and the validator's pending-ref
+    /// list. Vote-key TTL is aligned with the voting window (issue #1398).
     ///
-    /// Once `threshold` distinct, currently-active validators have voted
-    /// for the same claim within the voting window, this call commits the
-    /// `Milestone` and cross-calls `progress.advance_level`, exactly like
-    /// `approve_milestone` did for a single validator — attribution on the
-    /// committed record goes to whichever validator's vote happened to
-    /// cross the threshold.
-    ///
-    /// A vote past the configured voting window starts a fresh round,
-    /// discarding all prior votes for this claim (see `PendingMilestoneClaim::round`).
-    /// If `revoke_validator` is called against a validator with a still-open
-    /// vote on a sub-threshold claim, that vote is retroactively invalidated
-    /// (the claim's tally is decremented) — see `revoke_validator`.
+    /// Once `threshold` distinct active validators have voted within the
+    /// window, this call commits the `Milestone` and cross-calls
+    /// `progress.advance_level`.
     pub fn attest_milestone(
         env: Env,
         validator_wallet: Address,
@@ -1643,9 +1645,6 @@ impl VerificationContract {
             return Err(VerificationError::ValidatorInactive);
         }
 
-        // Already-committed claims (or evidence reused from any other
-        // milestone) are rejected up front — an attestation can never be
-        // cast against a claim that already has a Milestone on record.
         if env
             .storage()
             .persistent()
@@ -1657,6 +1656,7 @@ impl VerificationContract {
         let configured_threshold = Self::get_milestone_threshold(env.clone());
         let window_secs = Self::get_voting_window_secs(env.clone());
         let now = env.ledger().timestamp();
+        let desc_hash = Self::hash_description(&env, &description);
 
         let claim_key = DataKey::PendingMilestoneClaim(player_id, evidence_hash.clone());
         let mut claim: PendingMilestoneClaim = env
@@ -1667,23 +1667,34 @@ impl VerificationContract {
                 player_id,
                 evidence_hash: evidence_hash.clone(),
                 description: description.clone(),
+                description_hash: desc_hash.clone(),
                 vote_count: 0,
                 round: 0,
                 created_at: now,
                 threshold: configured_threshold,
+                voters: Vec::new(&env),
             });
 
-        // Expire a stale sub-threshold round: bump `round` and reset the
-        // tally in place. Prior votes become unreachable (their storage key
-        // is scoped to the old round) without needing to enumerate or
-        // delete them — see `DataKey::PendingMilestoneVote`.
+        // Expire a stale sub-threshold round: delete prior vote keys, bump
+        // round, reset tally. The first voter of the new round sets description.
         if claim.vote_count > 0 && now.saturating_sub(claim.created_at) > window_secs {
+            Self::delete_claim_round_votes(&env, &claim);
             claim.round = claim.round.saturating_add(1);
             claim.vote_count = 0;
             claim.created_at = now;
-            claim.description = description.clone();
             claim.threshold = configured_threshold;
+            claim.voters = Vec::new(&env);
             events::attestation_window_expired(&env, player_id, &evidence_hash, claim.round);
+        }
+
+        if claim.vote_count > 0 {
+            if desc_hash != claim.description_hash {
+                return Err(VerificationError::DescriptionMismatch);
+            }
+        } else {
+            // First voter of this round locks description + hash.
+            claim.description = description.clone();
+            claim.description_hash = desc_hash.clone();
         }
 
         let vote_key = DataKey::PendingMilestoneVote(
@@ -1696,10 +1707,6 @@ impl VerificationContract {
             return Err(VerificationError::DuplicateAttestation);
         }
 
-        // Bounded per-validator pending-vote cap. Lazily prune entries that
-        // reference a claim which has since committed (removed) or moved to
-        // a later round (expired), so a validator's legitimate concurrent
-        // capacity is not permanently eaten by claims that already resolved.
         let pending_votes_key = DataKey::ValidatorPendingVotes(validator_wallet.clone());
         let existing_refs: Vec<PendingVoteRef> = env
             .storage()
@@ -1709,15 +1716,6 @@ impl VerificationContract {
         let mut live_refs: Vec<PendingVoteRef> = Vec::new(&env);
         for i in 0..existing_refs.len() {
             let vref = existing_refs.get(i).unwrap();
-            // This validator's own ref for the exact claim being voted on
-            // right now must be checked against `claim.round` in memory, not
-            // by re-reading storage: when this call is itself the one that
-            // just bumped the round on expiry (above), storage still shows
-            // the pre-bump round until this transaction's writes land further
-            // down. Reading storage here would then treat the just-expired
-            // round-N ref as still live, double-booking one slot in this
-            // validator's MAX_PENDING_VOTES_PER_VALIDATOR budget once the
-            // fresh round-(N+1) ref is pushed below.
             if vref.player_id == player_id && vref.evidence_hash == evidence_hash {
                 if vref.round == claim.round {
                     live_refs.push_back(vref);
@@ -1742,11 +1740,13 @@ impl VerificationContract {
 
         claim.vote_count =
             safe_add_u32(claim.vote_count, 1).map_err(|_| VerificationError::Overflow)?;
+        claim.voters.push_back(validator_wallet.clone());
 
+        let (ttl_min, ttl_max) = Self::attestation_vote_ttl(window_secs);
         env.storage().persistent().set(&vote_key, &now);
         env.storage()
             .persistent()
-            .extend_ttl(&vote_key, PERSISTENT_TTL_MIN, PERSISTENT_TTL_MAX);
+            .extend_ttl(&vote_key, ttl_min, ttl_max);
 
         live_refs.push_back(PendingVoteRef {
             player_id,
@@ -1769,9 +1769,11 @@ impl VerificationContract {
             &evidence_hash,
             claim.vote_count,
             claim.threshold,
+            &claim.description_hash,
         );
 
         if claim.vote_count >= claim.threshold {
+            Self::delete_claim_round_votes(&env, &claim);
             env.storage().persistent().remove(&claim_key);
             let index = Self::commit_approved_milestone(
                 &env,
@@ -1794,9 +1796,13 @@ impl VerificationContract {
     }
 
     /// Return the current accumulator state for a (player_id, evidence_hash)
-    /// claim, if one is open. Returns `None` once the claim commits (its
-    /// storage is removed at that point) or before any validator has
-    /// attested to it.
+    /// claim, if one is open. Returns `None` once the claim commits (or is
+    /// pruned) or before any validator has attested to it.
+    ///
+    /// **Expiry**: an expired (window-elapsed, sub-threshold) claim remains
+    /// readable here until `prune_expired_claim` deletes it or the next
+    /// `attest_milestone` starts a fresh round. Callers that need expiry
+    /// status should also call `is_attestation_window_expired`.
     pub fn get_pending_claim(
         env: Env,
         player_id: u64,
@@ -1867,6 +1873,40 @@ impl VerificationContract {
             }
             _ => false,
         }
+    }
+
+
+    /// Permissionless cleanup for an abandoned / expired pending claim
+    /// (issue #1398). Deletes the claim and every `PendingMilestoneVote`
+    /// / `ValidatorPendingVotes` ref for its current round.
+    ///
+    /// Returns `ClaimNotFound` if no claim exists, `ClaimNotExpired` if the
+    /// voting window has not yet elapsed.
+    pub fn prune_expired_claim(
+        env: Env,
+        player_id: u64,
+        evidence_hash: String,
+    ) -> Result<(), VerificationError> {
+        Self::require_not_paused(&env)?;
+        Self::require_initialized(&env)?;
+
+        let claim_key = DataKey::PendingMilestoneClaim(player_id, evidence_hash.clone());
+        let claim: PendingMilestoneClaim = env
+            .storage()
+            .persistent()
+            .get(&claim_key)
+            .ok_or(VerificationError::ClaimNotFound)?;
+
+        let window = Self::get_voting_window_secs(env.clone());
+        let expired = claim.vote_count > 0
+            && env.ledger().timestamp().saturating_sub(claim.created_at) > window;
+        if !expired {
+            return Err(VerificationError::ClaimNotExpired);
+        }
+
+        Self::delete_claim_round_votes(&env, &claim);
+        env.storage().persistent().remove(&claim_key);
+        Ok(())
     }
 
     /// Register an ed25519 public key used to verify off-chain milestone
@@ -2210,8 +2250,8 @@ impl VerificationContract {
     /// `get_validator_milestones_page`.
     ///
     /// **Ordering**: entries are returned in insertion order (oldest first).
-    pub fn list_disputes_page(env: Env, offset: u32, limit: u32) -> Vec<(u64, u32)> {
-        let open_index: Vec<(u64, u32)> = env
+    pub fn list_disputes_page(env: Env, offset: u32, limit: u32) -> Vec<(u64, u32, u32)> {
+        let open_index: Vec<(u64, u32, u32)> = env
             .storage()
             .persistent()
             .get(&DataKey::OpenDisputeIndex)
@@ -2219,7 +2259,7 @@ impl VerificationContract {
 
         let total = open_index.len();
         let cap = limit.min(50);
-        let mut page: Vec<(u64, u32)> = Vec::new(&env);
+        let mut page: Vec<(u64, u32, u32)> = Vec::new(&env);
         let mut i = offset;
         while i < total && page.len() < cap {
             page.push_back(open_index.get(i).unwrap());
@@ -2858,9 +2898,9 @@ impl VerificationContract {
         Self::require_initialized(&env)?;
         Self::require_migration_active(&env)?;
 
-        let dispute_key = DataKey::MilestoneDispute(player_id, milestone_index);
+        let round = dispute.round;
+        let dispute_key = DataKey::MilestoneDispute(player_id, milestone_index, round);
 
-        // ── Idempotency ───────────────────────────────────────────────────────
         if let Some(existing) = env
             .storage()
             .persistent()
@@ -2868,23 +2908,32 @@ impl VerificationContract {
         {
             let identical = existing.player_id == dispute.player_id
                 && existing.milestone_index == dispute.milestone_index
+                && existing.round == dispute.round
                 && existing.reason == dispute.reason
                 && existing.disputed_at == dispute.disputed_at
                 && existing.resolved == dispute.resolved
-                && existing.upheld == dispute.upheld;
+                && existing.upheld == dispute.upheld
+                && existing.resolved_at == dispute.resolved_at;
             if identical {
                 return Ok(());
             }
             return Err(VerificationError::DisputeAlreadyExists);
         }
 
-        // ── Write dispute record ──────────────────────────────────────────────
         env.storage().persistent().set(&dispute_key, &dispute);
         env.storage()
             .persistent()
             .extend_ttl(&dispute_key, PERSISTENT_TTL_MIN, PERSISTENT_TTL_MAX);
 
-        // ── Update PlayerDisputes(player_id) ──────────────────────────────────
+        let round_key = DataKey::DisputeRound(player_id, milestone_index);
+        let prev_round: u32 = env.storage().persistent().get(&round_key).unwrap_or(0);
+        if !env.storage().persistent().has(&round_key) || round >= prev_round {
+            env.storage().persistent().set(&round_key, &round);
+            env.storage()
+                .persistent()
+                .extend_ttl(&round_key, PERSISTENT_TTL_MIN, PERSISTENT_TTL_MAX);
+        }
+
         let pd_key = DataKey::PlayerDisputes(player_id);
         let mut pd: Vec<u32> = env
             .storage()
@@ -2899,19 +2948,18 @@ impl VerificationContract {
                 .extend_ttl(&pd_key, PERSISTENT_TTL_MIN, PERSISTENT_TTL_MAX);
         }
 
-        // ── Update OpenDisputeIndex + ActiveDisputesCount (if unresolved) ─────
         if !dispute.resolved {
             let odi_key = DataKey::OpenDisputeIndex;
-            let mut odi: Vec<(u64, u32)> = env
+            let mut odi: Vec<(u64, u32, u32)> = env
                 .storage()
                 .persistent()
                 .get(&odi_key)
                 .unwrap_or_else(|| Vec::new(&env));
-            let already_open = odi
-                .iter()
-                .any(|(pid, midx)| pid == player_id && midx == milestone_index);
+            let already_open = odi.iter().any(|(pid, midx, r)| {
+                pid == player_id && midx == milestone_index && r == round
+            });
             if !already_open {
-                odi.push_back((player_id, milestone_index));
+                odi.push_back((player_id, milestone_index, round));
                 env.storage().persistent().set(&odi_key, &odi);
                 env.storage().persistent().extend_ttl(
                     &odi_key,
@@ -2923,6 +2971,13 @@ impl VerificationContract {
                 let adc: u32 = env.storage().instance().get(&adc_key).unwrap_or(0u32);
                 let new_adc = safe_add_u32(adc, 1).map_err(|_| VerificationError::Overflow)?;
                 env.storage().instance().set(&adc_key, &new_adc);
+
+                let poc_key = DataKey::PlayerOpenDisputeCount(player_id);
+                let poc: u32 = env.storage().persistent().get(&poc_key).unwrap_or(0u32);
+                env.storage().persistent().set(
+                    &poc_key,
+                    &safe_add_u32(poc, 1).map_err(|_| VerificationError::Overflow)?,
+                );
             }
         }
 
@@ -2958,8 +3013,11 @@ impl VerificationContract {
 
     /// Allow a player to dispute a milestone they believe was wrongly attributed.
     /// Only the player associated with `player_id` can submit a dispute.
-    /// Stores the dispute with reason and timestamp, and emits a `milestone_disputed` event.
-    /// Admin can later query disputes and resolve them.
+    ///
+    /// Disputes are keyed by `(player_id, milestone_index, round)` (issue #1396).
+    /// After a round is resolved, a new round may be opened once
+    /// `DISPUTE_REOPEN_COOLDOWN_SECS` has elapsed, up to `MAX_DISPUTE_ROUNDS`.
+    /// Open disputes per player are capped at `MAX_OPEN_DISPUTES_PER_PLAYER`.
     pub fn dispute_milestone(
         env: Env,
         player_wallet: Address,
@@ -2974,17 +3032,12 @@ impl VerificationContract {
 
         player_wallet.require_auth();
 
-        // Verify the milestone exists
         let milestone: Milestone = env
             .storage()
             .persistent()
             .get::<DataKey, Milestone>(&DataKey::Milestone(player_id, milestone_index))
             .ok_or(VerificationError::MilestoneNotFound)?;
 
-        // Verify the caller's wallet actually corresponds to player_id
-        // by making a cross-contract call to the registration contract.
-        // This replaces the previous tautological check (milestone.player_id
-        // could never differ from player_id) with a real authorization gate.
         let reg_addr = env
             .storage()
             .instance()
@@ -3003,17 +3056,44 @@ impl VerificationContract {
             return Err(VerificationError::Unauthorized);
         }
 
-        // Check if dispute already exists
-        let dispute_key = DataKey::MilestoneDispute(player_id, milestone_index);
-        if env.storage().persistent().has(&dispute_key) {
-            return Err(VerificationError::InvalidInput);
+        let poc_key = DataKey::PlayerOpenDisputeCount(player_id);
+        let open_count: u32 = env.storage().persistent().get(&poc_key).unwrap_or(0u32);
+        if open_count >= MAX_OPEN_DISPUTES_PER_PLAYER {
+            return Err(VerificationError::TooManyOpenDisputes);
         }
 
-        // Snapshot the jury configuration at filing time so later admin
-        // changes to JuryConfig cannot alter this dispute's rules mid-vote.
+        let round_key = DataKey::DisputeRound(player_id, milestone_index);
+        let now = env.ledger().timestamp();
+        let new_round = if let Some(cur_round) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, u32>(&round_key)
+        {
+            let existing: MilestoneDispute = env
+                .storage()
+                .persistent()
+                .get(&DataKey::MilestoneDispute(player_id, milestone_index, cur_round))
+                .ok_or(VerificationError::MilestoneNotFound)?;
+            if !existing.resolved {
+                return Err(VerificationError::DisputeAlreadyOpen);
+            }
+            let next = safe_add_u32(cur_round, 1).map_err(|_| VerificationError::Overflow)?;
+            if next >= MAX_DISPUTE_ROUNDS {
+                return Err(VerificationError::MaxDisputeRoundsReached);
+            }
+            if now < existing
+                .resolved_at
+                .saturating_add(DISPUTE_REOPEN_COOLDOWN_SECS)
+            {
+                return Err(VerificationError::DisputeCooldown);
+            }
+            next
+        } else {
+            0u32
+        };
+
         let jury_config = Self::get_jury_config_internal(&env);
         let jury_required = impact_score >= jury_config.impact_threshold;
-        let now = env.ledger().timestamp();
         let voting_deadline = if jury_required {
             safe_add_u64(now, jury_config.voting_window_secs)
                 .map_err(|_| VerificationError::Overflow)?
@@ -3024,10 +3104,12 @@ impl VerificationContract {
         let dispute = MilestoneDispute {
             player_id,
             milestone_index,
+            round: new_round,
             reason: reason.clone(),
             disputed_at: now,
             resolved: false,
             upheld: false,
+            resolved_at: 0,
             impact_score,
             jury_required,
             quorum: jury_config.quorum,
@@ -3036,14 +3118,18 @@ impl VerificationContract {
             votes_against: 0,
         };
 
-        // Keep the approver address from the milestone for conflict-of-interest checks.
-        // This is read during cast_dispute_vote via the Milestone storage record directly.
-        // Suppress the unused-variable warning — `milestone` was fetched above for
-        // existence validation; the approver address is re-read from storage in
-        // cast_dispute_vote to avoid re-serialising the full record here.
         let _ = &milestone.validator;
 
+        let dispute_key = DataKey::MilestoneDispute(player_id, milestone_index, new_round);
         env.storage().persistent().set(&dispute_key, &dispute);
+        env.storage()
+            .persistent()
+            .extend_ttl(&dispute_key, PERSISTENT_TTL_MIN, PERSISTENT_TTL_MAX);
+
+        env.storage().persistent().set(&round_key, &new_round);
+        env.storage()
+            .persistent()
+            .extend_ttl(&round_key, PERSISTENT_TTL_MIN, PERSISTENT_TTL_MAX);
 
         let player_disputes_key = DataKey::PlayerDisputes(player_id);
         let mut player_disputes: Vec<u32> = env
@@ -3073,15 +3159,21 @@ impl VerificationContract {
             &safe_add_u32(count, 1).map_err(|_| VerificationError::Overflow)?,
         );
 
-        // Maintain the global open-dispute index so list_disputes_page can
-        // enumerate unresolved disputes without knowing every (player_id, index) pair.
+        env.storage().persistent().set(
+            &poc_key,
+            &safe_add_u32(open_count, 1).map_err(|_| VerificationError::Overflow)?,
+        );
+        env.storage()
+            .persistent()
+            .extend_ttl(&poc_key, PERSISTENT_TTL_MIN, PERSISTENT_TTL_MAX);
+
         let open_index_key = DataKey::OpenDisputeIndex;
-        let mut open_index: Vec<(u64, u32)> = env
+        let mut open_index: Vec<(u64, u32, u32)> = env
             .storage()
             .persistent()
             .get(&open_index_key)
             .unwrap_or_else(|| Vec::new(&env));
-        open_index.push_back((player_id, milestone_index));
+        open_index.push_back((player_id, milestone_index, new_round));
         env.storage().persistent().set(&open_index_key, &open_index);
         env.storage().persistent().extend_ttl(
             &open_index_key,
@@ -3095,9 +3187,8 @@ impl VerificationContract {
 
     /// Resolve a filed milestone dispute (admin only).
     ///
-    /// This marks the dispute as resolved and records whether the admin upheld
-    /// it. It does not roll back player progress; that corrective workflow is
-    /// intentionally handled separately.
+    /// Operates on the latest dispute round for `(player_id, milestone_index)`.
+    /// Records `resolved_at` so a re-dispute cooldown can be enforced.
     ///
     /// Returns `DisputeRequiresJury` for disputes that were routed to the jury
     /// path at filing time (`jury_required == true`) — those must be finalized
@@ -3113,7 +3204,12 @@ impl VerificationContract {
         Self::require_initialized(&env)?;
         let admin = require_admin(&env, &DataKey::Admin, ADMIN_BUMP_LEDGERS)?;
 
-        let dispute_key = DataKey::MilestoneDispute(player_id, milestone_index);
+        let round: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::DisputeRound(player_id, milestone_index))
+            .ok_or(VerificationError::MilestoneNotFound)?;
+        let dispute_key = DataKey::MilestoneDispute(player_id, milestone_index, round);
         let mut dispute: MilestoneDispute = env
             .storage()
             .persistent()
@@ -3124,13 +3220,14 @@ impl VerificationContract {
             return Err(VerificationError::DisputeAlreadyResolved);
         }
 
-        // Jury-required disputes must be finalized via tally_dispute, not by admin.
         if dispute.jury_required {
             return Err(VerificationError::DisputeRequiresJury);
         }
 
+        let now = env.ledger().timestamp();
         dispute.resolved = true;
         dispute.upheld = upheld;
+        dispute.resolved_at = now;
         env.storage().persistent().set(&dispute_key, &dispute);
 
         let count: u32 = env
@@ -3143,18 +3240,25 @@ impl VerificationContract {
             &safe_sub_u32(count, 1).map_err(|_| VerificationError::Overflow)?,
         );
 
-        // Remove this dispute from the global open-dispute index so it no
-        // longer appears in list_disputes_page results.
+        let poc_key = DataKey::PlayerOpenDisputeCount(player_id);
+        let poc: u32 = env.storage().persistent().get(&poc_key).unwrap_or(0u32);
+        if poc > 0 {
+            env.storage().persistent().set(
+                &poc_key,
+                &safe_sub_u32(poc, 1).map_err(|_| VerificationError::Overflow)?,
+            );
+        }
+
         let open_index_key = DataKey::OpenDisputeIndex;
-        let open_index: Vec<(u64, u32)> = env
+        let open_index: Vec<(u64, u32, u32)> = env
             .storage()
             .persistent()
             .get(&open_index_key)
             .unwrap_or_else(|| Vec::new(&env));
-        let mut new_index: Vec<(u64, u32)> = Vec::new(&env);
+        let mut new_index: Vec<(u64, u32, u32)> = Vec::new(&env);
         for i in 0..open_index.len() {
             let entry = open_index.get(i).unwrap();
-            if entry != (player_id, milestone_index) {
+            if entry != (player_id, milestone_index, round) {
                 new_index.push_back(entry);
             }
         }
@@ -3258,8 +3362,13 @@ impl VerificationContract {
             return Err(VerificationError::ValidatorInactive);
         }
 
-        // Load the dispute.
-        let dispute_key = DataKey::MilestoneDispute(player_id, milestone_index);
+        // Load the latest-round dispute.
+        let round: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::DisputeRound(player_id, milestone_index))
+            .ok_or(VerificationError::MilestoneNotFound)?;
+        let dispute_key = DataKey::MilestoneDispute(player_id, milestone_index, round);
         let mut dispute: MilestoneDispute = env
             .storage()
             .persistent()
@@ -3293,7 +3402,7 @@ impl VerificationContract {
         }
 
         // Rule 3: validator must not have already voted.
-        let vote_key = DataKey::DisputeVote(player_id, milestone_index, validator.clone());
+        let vote_key = DataKey::DisputeVote(player_id, milestone_index, round, validator.clone());
         if env.storage().persistent().has(&vote_key) {
             return Err(VerificationError::AlreadyVoted);
         }
@@ -3323,7 +3432,7 @@ impl VerificationContract {
             .extend_ttl(&dispute_key, PERSISTENT_TTL_MIN, PERSISTENT_TTL_MAX);
 
         // Update the per-dispute vote count index.
-        let count_key = DataKey::DisputeVoteCount(player_id, milestone_index);
+        let count_key = DataKey::DisputeVoteCount(player_id, milestone_index, round);
         let vote_count: u32 = env.storage().persistent().get(&count_key).unwrap_or(0u32);
         let new_count = safe_add_u32(vote_count, 1).map_err(|_| VerificationError::Overflow)?;
         env.storage().persistent().set(&count_key, &new_count);
@@ -3356,7 +3465,12 @@ impl VerificationContract {
         Self::require_not_paused(&env)?;
         Self::require_initialized(&env)?;
 
-        let dispute_key = DataKey::MilestoneDispute(player_id, milestone_index);
+        let round: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::DisputeRound(player_id, milestone_index))
+            .ok_or(VerificationError::MilestoneNotFound)?;
+        let dispute_key = DataKey::MilestoneDispute(player_id, milestone_index, round);
         let mut dispute: MilestoneDispute = env
             .storage()
             .persistent()
@@ -3408,6 +3522,7 @@ impl VerificationContract {
 
         dispute.resolved = true;
         dispute.upheld = upheld;
+        dispute.resolved_at = now;
         env.storage().persistent().set(&dispute_key, &dispute);
 
         // Decrement active disputes counter.
@@ -3421,17 +3536,26 @@ impl VerificationContract {
             &safe_sub_u32(count, 1).map_err(|_| VerificationError::Overflow)?,
         );
 
+        let poc_key = DataKey::PlayerOpenDisputeCount(player_id);
+        let poc: u32 = env.storage().persistent().get(&poc_key).unwrap_or(0u32);
+        if poc > 0 {
+            env.storage().persistent().set(
+                &poc_key,
+                &safe_sub_u32(poc, 1).map_err(|_| VerificationError::Overflow)?,
+            );
+        }
+
         // Remove from the global open-dispute index.
         let open_index_key = DataKey::OpenDisputeIndex;
-        let open_index: Vec<(u64, u32)> = env
+        let open_index: Vec<(u64, u32, u32)> = env
             .storage()
             .persistent()
             .get(&open_index_key)
             .unwrap_or_else(|| Vec::new(&env));
-        let mut new_index: Vec<(u64, u32)> = Vec::new(&env);
+        let mut new_index: Vec<(u64, u32, u32)> = Vec::new(&env);
         for i in 0..open_index.len() {
             let entry = open_index.get(i).unwrap();
-            if entry != (player_id, milestone_index) {
+            if entry != (player_id, milestone_index, round) {
                 new_index.push_back(entry);
             }
         }
@@ -3455,29 +3579,29 @@ impl VerificationContract {
         Ok(())
     }
 
-    /// Query a milestone dispute by player_id and milestone_index.
+    /// Query the latest-round milestone dispute for `(player_id, milestone_index)`.
     pub fn get_dispute(
         env: Env,
         player_id: u64,
         milestone_index: u32,
     ) -> Result<MilestoneDispute, VerificationError> {
-        let dispute_key = DataKey::MilestoneDispute(player_id, milestone_index);
+        let round: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::DisputeRound(player_id, milestone_index))
+            .ok_or(VerificationError::MilestoneNotFound)?;
         env.storage()
             .persistent()
-            .get(&dispute_key)
+            .get(&DataKey::MilestoneDispute(player_id, milestone_index, round))
             .ok_or(VerificationError::MilestoneNotFound)
     }
 
-    /// Boolean convenience check. Returns `true` if a dispute exists for the
-    /// given `(player_id, milestone_index)` pair, `false` otherwise.
-    ///
-    /// This is a thin read-only wrapper around `get_dispute` — no new storage
-    /// is introduced. Mirrors the `is_active_validator` pattern: callers that
-    /// only need a yes/no answer avoid handling a `Result`/error path.
+    /// Boolean convenience check. Returns `true` if any dispute round exists
+    /// for the given `(player_id, milestone_index)` pair.
     pub fn has_dispute(env: Env, player_id: u64, milestone_index: u32) -> bool {
         env.storage()
             .persistent()
-            .has(&DataKey::MilestoneDispute(player_id, milestone_index))
+            .has(&DataKey::DisputeRound(player_id, milestone_index))
     }
 
     // -------------------------------------------------------------------------
@@ -3662,7 +3786,7 @@ impl VerificationContract {
                 if env
                     .storage()
                     .persistent()
-                    .has(&DataKey::MilestoneDispute(player_id, i))
+                    .has(&DataKey::DisputeRound(player_id, i))
                 {
                     dispute_count += 1;
                 }
@@ -3725,7 +3849,7 @@ impl VerificationContract {
                 if env
                     .storage()
                     .persistent()
-                    .has(&DataKey::MilestoneDispute(player_id, i))
+                    .has(&DataKey::DisputeRound(player_id, i))
                 {
                     list.push_back(i);
                 }
@@ -3896,6 +4020,130 @@ impl VerificationContract {
         invalidated
     }
 
+    /// `sha256(description.to_bytes())` — binds every vote in an
+    /// `attest_milestone` round to the exact same description text without
+    /// needing to store (or compare) the full string per-vote (issue #1397).
+    fn hash_description(env: &Env, description: &String) -> BytesN<32> {
+        let mut buf = Bytes::new(env);
+        buf.append(&description.to_bytes());
+        env.crypto().sha256(&buf).into()
+    }
+
+    /// TTL bounds for a `DataKey::PendingMilestoneVote` marker, derived from
+    /// the *current* voting window rather than the blanket
+    /// `PERSISTENT_TTL_MAX` — a vote marker only needs to outlive its own
+    /// round's voting window (plus a safety margin), not the maximum policy
+    /// TTL, so a short admin-configured window does not force every vote key
+    /// to be kept alive for up to `PERSISTENT_TTL_MAX` ledgers regardless.
+    /// Returns `(threshold_ttl, extend_to_ttl)` for `extend_ttl`.
+    fn attestation_vote_ttl(window_secs: u64) -> (u32, u32) {
+        let window_ledgers = (window_secs / 5) as u32;
+        let ttl = window_ledgers
+            .saturating_add(ATTESTATION_VOTE_TTL_MARGIN_LEDGERS)
+            .max(PERSISTENT_TTL_MIN)
+            .min(PERSISTENT_TTL_MAX);
+        (PERSISTENT_TTL_MIN.min(ttl), ttl)
+    }
+
+    /// Delete every `DataKey::PendingMilestoneVote` entry cast in `claim`'s
+    /// current round (bounded by `claim.voters`, itself bounded by
+    /// `threshold <= MAX_VALIDATORS`), and prune the matching
+    /// `(player_id, evidence_hash, round)` reference from each voter's
+    /// `DataKey::ValidatorPendingVotes` list. Called on round expiry, on
+    /// threshold-commit, and by `prune_expired_claim` (issue #1398) so
+    /// stale vote storage does not linger until natural TTL expiry.
+    fn delete_claim_round_votes(env: &Env, claim: &PendingMilestoneClaim) {
+        for i in 0..claim.voters.len() {
+            let w = claim.voters.get(i).unwrap();
+            let vote_key = DataKey::PendingMilestoneVote(
+                claim.player_id,
+                claim.evidence_hash.clone(),
+                claim.round,
+                w.clone(),
+            );
+            env.storage().persistent().remove(&vote_key);
+
+            let pkey = DataKey::ValidatorPendingVotes(w.clone());
+            if let Some(refs) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, Vec<PendingVoteRef>>(&pkey)
+            {
+                let mut kept: Vec<PendingVoteRef> = Vec::new(env);
+                for j in 0..refs.len() {
+                    let r = refs.get(j).unwrap();
+                    if !(r.player_id == claim.player_id
+                        && r.evidence_hash == claim.evidence_hash
+                        && r.round == claim.round)
+                    {
+                        kept.push_back(r);
+                    }
+                }
+                if kept.is_empty() {
+                    env.storage().persistent().remove(&pkey);
+                } else {
+                    env.storage().persistent().set(&pkey, &kept);
+                }
+            }
+        }
+    }
+
+    /// Gate milestone commitment on the player being currently active in
+    /// the registration contract (issue #1399).
+    ///
+    /// **Documented permissive fallback**: if `DataKey::RegistrationContract`
+    /// has never been wired (`set_registration_contract`), this check is
+    /// skipped entirely and the call is allowed through unchanged — this
+    /// preserves today's behavior for any deployment/test that has not yet
+    /// wired the registration contract. Production deployments MUST call
+    /// `set_registration_contract` for this gate to have any effect; an
+    /// unwired contract is not a bypass mechanism, it is the pre-#1399
+    /// default.
+    ///
+    /// Once wired:
+    /// 1. `get_player(player_id)` must succeed — any failure (unknown
+    ///    `player_id`, or a minimal stub that does not implement this
+    ///    method at all) is treated uniformly as `PlayerNotRegistered`.
+    /// 2. `is_player_deactivated(player_id)` is then consulted on a
+    ///    best-effort basis: `true` → `PlayerDeactivated`. If the callee
+    ///    does not implement this method (an older/minimal registration
+    ///    stub), the call fails at the host level and is treated as "not
+    ///    deactivated" rather than failing closed, since this method is a
+    ///    newer addition to the registration contract surface than
+    ///    `get_player` itself.
+    fn require_active_player(env: &Env, player_id: u64) -> Result<(), VerificationError> {
+        let Some(reg_addr) = env
+            .storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::RegistrationContract)
+        else {
+            return Ok(());
+        };
+
+        let args: Vec<Val> = (player_id,).into_val(env);
+
+        let exists = env.try_invoke_contract::<RegPlayerProfile, VerificationError>(
+            &reg_addr,
+            &Symbol::new(env, "get_player"),
+            args.clone(),
+        );
+        match exists {
+            Ok(Ok(_)) => {}
+            _ => return Err(VerificationError::PlayerNotRegistered),
+        }
+
+        let deactivated = env.try_invoke_contract::<bool, VerificationError>(
+            &reg_addr,
+            &Symbol::new(env, "is_player_deactivated"),
+            args,
+        );
+        if let Ok(Ok(true)) = deactivated {
+            return Err(VerificationError::PlayerDeactivated);
+        }
+
+        Ok(())
+    }
+
     /// Shared milestone commit used by `approve_milestone`,
     /// `submit_attested_milestone`, and `attest_milestone` (on threshold
     /// cross). Caller must already have authenticated the validator and
@@ -3907,6 +4155,8 @@ impl VerificationContract {
         description: String,
         evidence_hash: String,
     ) -> Result<u32, VerificationError> {
+        Self::require_active_player(env, player_id)?;
+
         let evidence_used_key = DataKey::EvidenceUsed(evidence_hash.clone());
         if env.storage().persistent().has(&evidence_used_key) {
             return Err(VerificationError::DuplicateEvidence);
@@ -4180,6 +4430,10 @@ mod tests {
                 registered_at: 0,
                 updated_at: 0,
             }
+        }
+
+        pub fn is_player_deactivated(_env: Env, _player_id: u64) -> bool {
+            false
         }
     }
 

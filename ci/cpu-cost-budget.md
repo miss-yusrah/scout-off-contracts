@@ -38,7 +38,7 @@ measured-cost trends can be tracked across commits.
 | registration   | `update_profile`                 | 10,000,000                |
 | registration   | `filter_players`                 | 15,000,000                |
 | verification   | `register_validator`             | 15,000,000                |
-| verification   | `approve_milestone`              | 20,000,000                |
+| verification   | `approve_milestone`              | 25,000,000                |
 | verification   | `attest_milestone`               | 25,000,000                |
 | verification   | `cast_dispute_vote`              | 20,000,000                |
 | verification   | `tally_dispute`                  | 30,000,000                |

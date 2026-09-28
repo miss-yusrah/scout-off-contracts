@@ -137,6 +137,12 @@ pub struct ValidatorPlayersPage {
 }
 
 /// A player-initiated dispute for a milestone.
+///
+/// Disputes are keyed by `(player_id, milestone_index, round)` (see
+/// `DataKey::MilestoneDispute`). Round 0 is the first filing; after
+/// resolution a new round may be opened once the reopen cooldown elapses,
+/// up to `MAX_DISPUTE_ROUNDS`. Getters that omit an explicit round return
+/// the latest round recorded in `DataKey::DisputeRound`.
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
 pub struct MilestoneDispute {
@@ -144,6 +150,8 @@ pub struct MilestoneDispute {
     pub player_id: u64,
     /// Per-player milestone index being disputed.
     pub milestone_index: u32,
+    /// Dispute round for this milestone (0 = first filing).
+    pub round: u32,
     /// Player-provided dispute reason.
     pub reason: String,
     /// Ledger timestamp when the dispute was opened, in Unix seconds.
@@ -152,6 +160,9 @@ pub struct MilestoneDispute {
     pub resolved: bool,
     /// Whether the dispute was upheld when resolved.
     pub upheld: bool,
+    /// Unix timestamp when the dispute was resolved (`0` while open).
+    /// Used to enforce the re-dispute cooldown.
+    pub resolved_at: u64,
     /// Impact score supplied when the dispute was filed.
     pub impact_score: u32,
     /// Whether this dispute requires a jury vote (impact_score >= jury threshold at filing time).
@@ -237,23 +248,27 @@ pub struct MilestoneAttestation {
 
 /// Bounded, fixed-size accumulator for a k-of-n milestone attestation claim
 /// (issue: threshold milestone approval). Keyed by canonical claim identity
-/// (player_id, evidence_hash) — see `attest_milestone` for why description
-/// text is intentionally excluded from the identity.
+/// (player_id, evidence_hash) — description text is intentionally excluded
+/// from the *identity* key, but every vote in a round must still commit to
+/// the same `description_hash` (issue #1397). The first voter of each round
+/// sets both `description` and `description_hash`; later mismatches are
+/// rejected with `DescriptionMismatch`.
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
 pub struct PendingMilestoneClaim {
     pub player_id: u64,
     pub evidence_hash: String,
     /// Description locked in by the first attestation of this (player_id,
-    /// evidence_hash, round). Later voters' description text does not
-    /// overwrite it, so the threshold-reaching validator cannot rewrite the
-    /// claim's narrative at the last moment.
+    /// evidence_hash, round). Later voters must supply a description whose
+    /// sha256 equals `description_hash`; the stored text is not overwritten.
     pub description: String,
+    /// `sha256(description)` locked by the first voter of the current round.
+    pub description_hash: BytesN<32>,
     /// Distinct, currently-valid active-validator votes accumulated so far
     /// in this round.
     pub vote_count: u32,
-    /// Bumped on every voting-window expiry; invalidates all prior votes
-    /// without touching their storage — see `DataKey::PendingMilestoneVote`.
+    /// Bumped on every voting-window expiry. Prior-round vote keys are
+    /// deleted via `voters` (issue #1398) rather than left to TTL alone.
     pub round: u32,
     /// Ledger timestamp (Unix seconds) this round started.
     pub created_at: u64,
@@ -261,6 +276,9 @@ pub struct PendingMilestoneClaim {
     /// the global threshold mid-vote cannot retroactively fast-track or
     /// invalidate an in-flight claim.
     pub threshold: u32,
+    /// Wallets that voted in the current round (bounded by `threshold` ≤
+    /// `MAX_VALIDATORS`). Enables O(threshold) cleanup on expiry / prune.
+    pub voters: Vec<Address>,
 }
 
 /// Reference to one of a validator's currently-open pending-claim votes.
@@ -368,7 +386,15 @@ pub enum DataKey {
     /// for which that validator has approved at least one milestone.
     /// Updated on every `approve_milestone` call (duplicates are skipped).
     ValidatorPlayers(Address),
-    MilestoneDispute(u64, u32),
+    /// Latest dispute round for `(player_id, milestone_index)`. Absent when
+    /// the milestone has never been disputed. Getters that omit an explicit
+    /// round read this key and then load `MilestoneDispute(player, idx, round)`.
+    DisputeRound(u64, u32),
+    /// Dispute record keyed by `(player_id, milestone_index, round)`.
+    MilestoneDispute(u64, u32, u32),
+    /// Count of currently-unresolved disputes filed by this player
+    /// (anti-spam cap — see `MAX_OPEN_DISPUTES_PER_PLAYER`).
+    PlayerOpenDisputeCount(u64),
     ActiveValidatorCount,
     TotalValidatorCount,
     /// Evidence hash → (player_id, milestone_index) for global uniqueness and usage lookup.
@@ -380,8 +406,9 @@ pub enum DataKey {
     /// player_id → Vec<u32> of milestone_index values.
     /// Updated on `dispute_milestone`.
     PlayerDisputes(u64),
-    /// Persistent global index of currently-unresolved (player_id, milestone_index) pairs.
-    /// Populated on `dispute_milestone`, pruned on `resolve_dispute`.
+    /// Persistent global index of currently-unresolved
+    /// `(player_id, milestone_index, round)` triples.
+    /// Populated on `dispute_milestone`, pruned on `resolve_dispute` / `tally_dispute`.
     /// Exposed via `list_disputes_page(offset, limit)`.
     OpenDisputeIndex,
 
@@ -457,11 +484,11 @@ pub enum DataKey {
     /// Defaults: impact_threshold=100, quorum=3, voting_window_secs=604800.
     JuryConfig,
     /// Individual validator vote on a jury-required dispute.
-    /// Keyed by (player_id, milestone_index, validator_wallet).
-    DisputeVote(u64, u32, Address),
-    /// Running vote count for a dispute, keyed by (player_id, milestone_index).
+    /// Keyed by (player_id, milestone_index, round, validator_wallet).
+    DisputeVote(u64, u32, u32, Address),
+    /// Running vote count for a dispute, keyed by (player_id, milestone_index, round).
     /// Provides an O(1) count without scanning individual DisputeVote entries.
-    DisputeVoteCount(u64, u32),
+    DisputeVoteCount(u64, u32, u32),
 
     // ── Validator revocation cascade re-review (issue #1039) ──
     /// Persisted `RevocationRecord` for a revoked validator wallet.

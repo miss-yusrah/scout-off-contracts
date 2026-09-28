@@ -1,5 +1,5 @@
 #![allow(deprecated)]
-use soroban_sdk::{Address, Env, String, Symbol};
+use soroban_sdk::{Address, BytesN, Env, String, Symbol};
 
 pub const MILESTONE_APPROVED: &str = "milestone_approved";
 pub const VALIDATOR_REGISTERED: &str = "validator_registered";
@@ -233,9 +233,7 @@ pub fn progress_contract_not_set(env: &Env, player_id: u64) {
     );
 }
 
-/// Emitted on every accepted `attest_milestone` vote (including the
-/// threshold-crossing one).
-/// topics: (event_name, validator)  data: (player_id, evidence_hash, vote_count, threshold)
+/// topics: (event_name, validator)  data: (player_id, evidence_hash, vote_count, threshold, description_hash)
 pub fn attestation_recorded(
     env: &Env,
     validator: &Address,
@@ -243,10 +241,17 @@ pub fn attestation_recorded(
     evidence_hash: &String,
     vote_count: u32,
     threshold: u32,
+    description_hash: &BytesN<32>,
 ) {
     env.events().publish(
         (Symbol::new(env, ATTESTATION_RECORDED), validator.clone()),
-        (player_id, evidence_hash.clone(), vote_count, threshold),
+        (
+            player_id,
+            evidence_hash.clone(),
+            vote_count,
+            threshold,
+            description_hash.clone(),
+        ),
     );
 }
 
