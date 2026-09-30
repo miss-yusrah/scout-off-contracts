@@ -31,6 +31,25 @@ pub struct ValidatorActivityReport {
     pub distinct_players: Vec<u64>,
 }
 
+// ---------------------------------------------------------------------------
+// Cross-contract view types (issue #1455)
+// Rather than duplicating PlayerVitals/PlayerProfile as local mirror types
+// (which silently drift when registration fields change), we re-export the
+// single authoritative definitions from scoutchain-shared-types.
+// Previously these were local mirror types named RegPlayerVitals /
+// RegPlayerProfile (referenced in issue #1014). They are now type aliases
+// pointing to the shared source of truth so a field rename in shared-types
+// produces a compile error here too.
+// ---------------------------------------------------------------------------
+
+/// Cross-contract view of player vitals, re-exported from scoutchain-shared-types.
+/// Use this when decoding registration.get_player results in verification logic.
+pub use scoutchain_shared_types::PlayerVitals as RegPlayerVitals;
+
+/// Cross-contract view of a full player profile, re-exported from scoutchain-shared-types.
+/// Use this when decoding registration.get_player results in verification logic.
+pub use scoutchain_shared_types::PlayerProfile as RegPlayerProfile;
+
 /// Richer validator status — distinguishes unregistered from revoked.
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
@@ -175,6 +194,15 @@ pub struct MilestoneDispute {
     pub votes_for: u32,
     /// Number of votes cast against upholding the dispute.
     pub votes_against: u32,
+    /// Unix timestamp snapshotted at filing time (#1375).
+    /// Only validators whose `registered_at < jury_eligibility_cutoff` may vote,
+    /// preventing a compromised admin from registering new validators mid-vote
+    /// to control the outcome.
+    pub jury_eligibility_cutoff: u64,
+    /// Affiliation of the validator who originally approved the disputed milestone,
+    /// snapshotted at filing time (#1375). Validators with the same affiliation are
+    /// excluded from voting to prevent colleagues from protecting each other.
+    pub approver_affiliation: String,
 }
 
 /// Admin-configurable jury parameters for high-impact milestone disputes.

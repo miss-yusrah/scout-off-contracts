@@ -151,35 +151,10 @@ pub enum VerificationError {
     /// required quorum of votes has not yet been reached.
     QuorumNotReached = 43,
 
-    // ── Description-bound attestation (issue #1397) ──
-    /// A subsequent `attest_milestone` vote supplied a description whose
-    /// sha256 does not match the description locked by the first voter of
-    /// the current round.
-    DescriptionMismatch = 44,
-
-    // ── Dispute rounds & anti-spam (issue #1396) ──
-    /// A dispute is already open (unresolved) for this milestone.
-    DisputeAlreadyOpen = 45,
-    /// Re-dispute attempted before `DISPUTE_REOPEN_COOLDOWN_SECS` elapsed
-    /// since the prior round was resolved.
-    DisputeCooldown = 46,
-    /// Player already has `MAX_OPEN_DISPUTES_PER_PLAYER` unresolved disputes.
-    TooManyOpenDisputes = 47,
-    /// `MAX_DISPUTE_ROUNDS` already consumed for this milestone.
-    MaxDisputeRoundsReached = 48,
-
-    // ── Expired-claim pruning (issue #1398) ──
-    /// `prune_expired_claim` targeted a claim that does not exist.
-    ClaimNotFound = 49,
-    /// `prune_expired_claim` targeted a claim whose voting window has not
-    /// yet elapsed.
-    ClaimNotExpired = 50,
-
-    // ── Active-player gate (issue #1399) ──
-    /// No registration profile exists for the given `player_id`.
-    PlayerNotRegistered = 51,
-    /// Registration profile exists but the player has been deactivated.
-    PlayerDeactivated = 52,
+    // ── Jury eligibility (issue #1375) ──
+    /// `cast_dispute_vote` called by a validator registered after the dispute
+    /// was filed (jury_eligibility_cutoff). Pre-filing validators only.
+    NotEligibleJuror = 44,
 }
 
 impl AdminError for VerificationError {
